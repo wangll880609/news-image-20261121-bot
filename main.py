@@ -123,92 +123,83 @@ FONT.update({
 
 
 def text_width(text, scale):
-    """Pixel width of text at the given scale (no trailing spacing)."""
-    if not text:
-        return 0
-    return len(text) * 6 * scale - scale
+    """Width in pixels of `text` at `scale` (no trailing spacing)."""
+    return (len(text) * 6 - 1) * scale if text else 0
 
 
 def wrap_lines(text, max_width, scale):
-    """Greedy word wrap. Returns a list of lines, each within max_width."""
-    words = text.split(" ")
-    lines = []
-    current = ""
-    for word in words:
-        trial = word if not current else current + " " + word
-        if text_width(trial, scale) <= max_width:
-            current = trial
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
+    """Greedy word wrap; every returned line fits within `max_width`."""
+    lines, current = [], ""
+    for word in text.split(" "):
+        joined = word if current == "" else current + " " + word
+        if text_width(joined, scale) <= max_width:
+            current = joined
+            continue
+        if current != "":
+            lines.append(current)
+        current = word
+    if current != "":
         lines.append(current)
     return lines
 
 
 class Canvas:
-    """An RGB image held as a flat bytearray."""
+    """A 1024x1024 RGB image stored as one flat bytearray."""
 
     def __init__(self, width, height, colour):
         self.width = width
         self.height = height
         self.pixels = bytearray(colour * (width * height))
 
+    def _row_span(self, row, x0, x1, colour):
+        start = (row * self.width + x0) * 3
+        self.pixels[start:(row * self.width + x1) * 3] = colour * (x1 - x0)
+
     def fill_rect(self, x, y, w, h, colour):
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.width, x + w)
-        y1 = min(self.height, y + h)
-        for row in range(y0, y1):
-            base = (row * self.width + x0) * 3
-            for col in range(x0, x1):
-                off = base + (col - x0) * 3
-                self.pixels[off] = colour[0]
-                self.pixels[off + 1] = colour[1]
-                self.pixels[off + 2] = colour[2]
+        left, top = max(0, x), max(0, y)
+        right = min(self.width, x + w)
+        bottom = min(self.height, y + h)
+        for row in range(top, bottom):
+            self._row_span(row, left, right, colour)
 
     def draw_text(self, x, y, text, scale, colour, bold=False):
-        """Draw text with the bitmap font. Bold adds a 1px right offset pass."""
-        passes = (0, 1) if bold else (0,)
-        for dx in passes:
-            cx = x + dx
+        """Render `text` with the bitmap font; bold overprints 1px right."""
+        offsets = (0, 1) if bold else (0,)
+        for shift in offsets:
+            pen = x + shift
             for ch in text:
                 glyph = FONT.get(ch)
+                pen += 6 * scale
                 if glyph is None:
-                    cx += 6 * scale
                     continue
                 for row, bits in enumerate(glyph):
-                    for col, bit in enumerate(bits):
-                        if bit == "1":
-                            self.fill_rect(
-                                cx + col * scale, y + row * scale,
-                                scale, scale, colour,
-                            )
-                cx += 6 * scale
+                    for col in range(5):
+                        if bits[col] == "1":
+                            self.fill_rect(pen - 6 * scale + col * scale,
+                                           y + row * scale, scale, scale, colour)
 
 
 def _png_chunk(kind, data):
-    out = struct.pack(">I", len(data)) + kind + data
-    out += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-    return out
+    body = kind + data
+    return (struct.pack(">I", len(data)) + body +
+            struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
 
 
 def write_png(path, canvas):
-    """Encode the canvas as a PNG file (filter 0, zlib level 9)."""
-    raw = bytearray()
-    row_bytes = canvas.width * 3
+    """Write `canvas` out as a PNG (filter 0, zlib level 9)."""
+    stride = canvas.width * 3
+    scanlines = bytearray()
     for y in range(canvas.height):
-        raw.append(0)
-        start = y * row_bytes
-        raw += canvas.pixels[start:start + row_bytes]
-    header = struct.pack(">IIBBBBB", canvas.width, canvas.height, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += _png_chunk(b"IHDR", header)
-    png += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png += _png_chunk(b"IEND", b"")
+        scanlines.append(0)
+        scanlines += canvas.pixels[y * stride:(y + 1) * stride]
+    header = struct.pack(">IIBBBBB", canvas.width, canvas.height,
+                         8, 2, 0, 0, 0)
+    blob = bytearray(b"\x89PNG\r\n\x1a\n")
+    blob += _png_chunk(b"IHDR", header)
+    blob += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
+    blob += _png_chunk(b"IEND", b"")
     with open(path, "wb") as handle:
-        handle.write(png)
+        handle.write(blob)
 
 
 # All 43 stories were published on Saturday 21 November 2026. Each entry is
@@ -325,78 +316,81 @@ def draw_section_header(canvas, x, y, title):
 
 
 def draw_story(canvas, x, y, headline, summary):
-    head_lines = wrap_lines(headline, COL_WIDTH, 2)
-    sum_lines = wrap_lines(summary, COL_WIDTH, 1)
-    assert len(head_lines) == 1, "headline too long: %r" % headline
-    assert len(sum_lines) == 1, "summary too long: %r" % summary
-    canvas.draw_text(x, y, head_lines[0], 2, INK)
-    canvas.draw_text(x, y + 17, sum_lines[0], 1, GREY)
+    heads = wrap_lines(headline, COL_WIDTH, 2)
+    sums = wrap_lines(summary, COL_WIDTH, 1)
+    assert len(heads) == 1, "headline too long: %r" % headline
+    assert len(sums) == 1, "summary too long: %r" % summary
+    canvas.draw_text(x, y, heads[0], 2, INK)
+    canvas.draw_text(x, y + 17, sums[0], 1, GREY)
     return y + 32
 
 
 def draw_column(canvas, x, start_y, sections):
-    y = start_y
+    cursor = start_y
     for section, items in sections:
-        y = draw_section_header(canvas, x, y, section)
+        cursor = draw_section_header(canvas, x, cursor, section)
         for headline, summary in items:
-            y = draw_story(canvas, x, y, headline, summary)
-        y += 6
-    return y
+            cursor = draw_story(canvas, x, cursor, headline, summary)
+        cursor += 6
+    return cursor
 
 
 def render():
     assert len(STORIES) == 43, "expected 43 stories, got %d" % len(STORIES)
-    by_section = {}
+    grouped = {}
     for section, headline, summary in STORIES:
-        by_section.setdefault(section, []).append((headline, summary))
-    for name in ("LEAD", "WORLD", "MARKETS", "SCIENCE", "SPORT"):
-        assert name in by_section, "missing section %s" % name
+        grouped.setdefault(section, []).append((headline, summary))
+    for wanted in ("LEAD", "WORLD", "MARKETS", "SCIENCE", "SPORT"):
+        assert wanted in grouped, "missing section %s" % wanted
 
-    canvas = Canvas(WIDTH, HEIGHT, PAPER)
+    page = Canvas(WIDTH, HEIGHT, PAPER)
 
-    # Masthead.
-    title = "THE DAILY FRONT PAGE"
-    canvas.draw_text((WIDTH - text_width(title, 4)) // 2, 24, title, 4, INK, bold=True)
-    canvas.fill_rect(MARGIN, 62, WIDTH - 2 * MARGIN, 3, INK)
-    date_line = "SATURDAY 21 NOVEMBER 2026 - 43 STORIES"
-    canvas.draw_text((WIDTH - text_width(date_line, 2)) // 2, 72, date_line, 2, INK)
-    canvas.fill_rect(MARGIN, 92, WIDTH - 2 * MARGIN, 1, INK)
+    # Masthead: title, rule, dateline, rule.
+    masthead = "THE DAILY FRONT PAGE"
+    page.draw_text((WIDTH - text_width(masthead, 4)) // 2, 24,
+                   masthead, 4, INK, bold=True)
+    page.fill_rect(MARGIN, 62, WIDTH - 2 * MARGIN, 3, INK)
+    dateline = "SATURDAY 21 NOVEMBER 2026 - 43 STORIES"
+    page.draw_text((WIDTH - text_width(dateline, 2)) // 2, 72,
+                   dateline, 2, INK)
+    page.fill_rect(MARGIN, 92, WIDTH - 2 * MARGIN, 1, INK)
 
     # Lead story, full width.
-    lead_head, lead_sum = by_section["LEAD"][0]
-    canvas.draw_text(MARGIN, 106, "LEAD", 1, GREY, bold=True)
-    canvas.draw_text(MARGIN, 118, lead_head, 3, INK, bold=True)
-    canvas.draw_text(MARGIN, 145, lead_sum, 2, GREY)
-    canvas.fill_rect(MARGIN, 168, WIDTH - 2 * MARGIN, 2, INK)
+    lead_head, lead_sum = grouped["LEAD"][0]
+    page.draw_text(MARGIN, 106, "LEAD", 1, GREY, bold=True)
+    page.draw_text(MARGIN, 118, lead_head, 3, INK, bold=True)
+    page.draw_text(MARGIN, 145, lead_sum, 2, GREY)
+    page.fill_rect(MARGIN, 168, WIDTH - 2 * MARGIN, 2, INK)
 
-    # Two columns: WORLD + SPORT on the left, MARKETS + SCIENCE on the right.
-    left_end = draw_column(canvas, LEFT_X, 184, [
-        ("WORLD", by_section["WORLD"]),
-        ("SPORT", by_section["SPORT"]),
+    # Two columns: WORLD + SPORT left, MARKETS + SCIENCE right.
+    left_end = draw_column(page, LEFT_X, 184, [
+        ("WORLD", grouped["WORLD"]),
+        ("SPORT", grouped["SPORT"]),
     ])
-    right_end = draw_column(canvas, RIGHT_X, 184, [
-        ("MARKETS", by_section["MARKETS"]),
-        ("SCIENCE", by_section["SCIENCE"]),
+    right_end = draw_column(page, RIGHT_X, 184, [
+        ("MARKETS", grouped["MARKETS"]),
+        ("SCIENCE", grouped["SCIENCE"]),
     ])
     assert left_end <= 960, "left column overflows: %d" % left_end
     assert right_end <= 960, "right column overflows: %d" % right_end
 
-    # Footer.
-    canvas.fill_rect(MARGIN, 968, WIDTH - 2 * MARGIN, 1, INK)
-    canvas.draw_text(MARGIN, 978, FOOTER, 1, GREY)
-    return canvas, left_end, right_end
+    # Footer: rule plus source line.
+    page.fill_rect(MARGIN, 968, WIDTH - 2 * MARGIN, 1, INK)
+    page.draw_text(MARGIN, 978, FOOTER, 1, GREY)
+    return page, left_end, right_end
 
 
 def main():
     out_dir = os.environ.get("OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    canvas, left_end, right_end = render()
-    path = os.path.join(out_dir, "entry.png")
-    write_png(path, canvas)
+    page, left_end, right_end = render()
+    target = os.path.join(out_dir, "entry.png")
+    write_png(target, page)
     print("stories: %d" % len(STORIES))
     print("size: %dx%d" % (WIDTH, HEIGHT))
-    print("left column ends at y=%d, right column ends at y=%d" % (left_end, right_end))
-    print("wrote %s" % path)
+    print("left column ends at y=%d, right column ends at y=%d"
+          % (left_end, right_end))
+    print("wrote %s" % target)
 
 
 if __name__ == "__main__":
